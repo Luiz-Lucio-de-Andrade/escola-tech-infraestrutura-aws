@@ -1,87 +1,336 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'IaC - Arquitetura Escola Tech: VPC, ALB, Auto Scaling (Spot) e RDS MySQL (Multi-AZ)'
+Description: >
+  Escola Tech - laboratorio completo em duas AZs: VPC, quatro subnets,
+  IGW, NAT zonal unico, ALB publico, Apache em EC2 privadas,
+  health checks e Auto Scaling por CPU. Sem IAM Role e sem HTTPS.
 
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Selecione a VPC padrão da sua conta.
-  PublicSubnets:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Selecione as duas sub-redes públicas para o ALB.
-  PrivateSubnets:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Selecione as duas sub-redes privadas para o Auto Scaling.
-  DBUsername:
+  InstanceType:
     Type: String
-    Default: adminescola
-  DBPassword:
-    Type: String
-    NoEcho: true
-    Description: Password da Base de Dados.
+    Default: t3.micro
+    Description: Tipo de EC2 permitido pelo seu AWS Sandbox.
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+  LatestAmazonLinux2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI publica Amazon Linux 2023 x86_64 da regiao selecionada.
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 6
+    Description: Instancias minimas (2 para redundancia entre AZs).
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 6
+    Description: Instancias iniciais.
+  MaxCapacity:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 10
+    Description: Limite superior de instancias.
 
 Resources:
-  # ==========================================
-  # 1. SEGURANÇA (SECURITY GROUPS)
-  # ==========================================
-  ALBSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+  EscolaTechVPC:
+    Type: AWS::EC2::VPC
     Properties:
-      GroupDescription: Permite trafego HTTP/HTTPS da internet para o Load Balancer
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: escola-tech-vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: escola-tech-subnet-public-1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: escola-tech-subnet-private-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: escola-tech-subnet-public-2
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: escola-tech-subnet-private-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: escola-tech-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      Tags:
+        - Key: Name
+          Value: escola-tech-rtb-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: escola-tech-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnetRouteTableAssociation1
+    Properties:
+      AllocationId: !GetAtt NatElasticIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: escola-tech-nat-gw
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EscolaTechVPC
+      Tags:
+        - Key: Name
+          Value: escola-tech-rtb-private
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
 
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Permite trafego apenas do Load Balancer para as Instancias EC2
-      VpcId: !Ref VpcId
+      GroupName: escola-tech-sg-ec2
+      GroupDescription: Apache - recebe HTTP somente do SG do ALB
+      VpcId: !Ref EscolaTechVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Repositorios e downloads HTTP pelo NAT
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Repositorios e downloads HTTPS pelo NAT
+      Tags:
+        - Key: Name
+          Value: escola-tech-sg-ec2
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: escola-tech-sg-alb
+      GroupDescription: ALB publico - entrada HTTP e HTTPS reservada, saida HTTP para EC2
+      VpcId: !Ref EscolaTechVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
-
-  RDSSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Permite trafego apenas das instancias EC2 para o MySQL (Porta 3306)
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
+          CidrIp: 0.0.0.0/0
+          Description: HTTP publico
         - IpProtocol: tcp
-          FromPort: 3306
-          ToPort: 3306
-          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Porta reservada; listener HTTPS requer certificado ACM
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+          Description: ALB encaminha HTTP somente as EC2
+      Tags:
+        - Key: Name
+          Value: escola-tech-sg-alb
 
-  # ==========================================
-  # 2. CAMADA DE ACESSO (LOAD BALANCER)
-  # ==========================================
-  EscolaTechALB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  EC2IngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      Name: alb-escola-tech
-      Scheme: internet-facing
-      SecurityGroups:
-        - !Ref ALBSecurityGroup
-      Subnets: !Ref PublicSubnets
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: Apenas ALB pode acessar Apache na porta 80
 
-  ALBTargetGroup:
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: EscolaTech-Web-Template
+      VersionDescription: Apache + log de diagnostico - equivalente a versao 2 do laboratorio
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmazonLinux2023Ami
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: escola-tech-ec2
+              - Key: Project
+                Value: EscolaTech
+          - ResourceType: volume
+            Tags:
+              - Key: Project
+                Value: EscolaTech
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            exec > >(tee -a /var/log/user-data.log /dev/console) 2>&1
+            set -euxo pipefail
+            echo "INICIANDO ESCOLA TECH"
+            dnf install -y httpd
+            echo '<h1>Escola Tech - Pagina de Matriculas</h1>' > /var/www/html/index.html
+            systemctl enable --now httpd
+            systemctl status httpd --no-pager
+            curl -I --max-time 10 http://127.0.0.1/
+            echo "ESCOLA TECH CONFIGURADA COM SUCESSO"
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: EscolaTech-Web-Template
+
+  WebTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: tg-escola-tech
-      Port: 80
+      Name: escola-tech-tg
+      VpcId: !Ref EscolaTechVPC
       Protocol: HTTP
-      VpcId: !Ref VpcId
+      ProtocolVersion: HTTP1
+      Port: 80
+      TargetType: instance
+      IpAddressType: ipv4
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: escola-tech-tg
 
-  ALBListener:
+  EscolaTechALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnetRouteTableAssociation1
+      - PublicSubnetRouteTableAssociation2
+    Properties:
+      Name: escola-tech-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: escola-tech-alb
+
+  HTTPListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       LoadBalancerArn: !Ref EscolaTechALB
@@ -89,66 +338,68 @@ Resources:
       Protocol: HTTP
       DefaultActions:
         - Type: forward
-          TargetGroupArn: !Ref ALBTargetGroup
+          TargetGroupArn: !Ref WebTargetGroup
 
-  # ==========================================
-  # 3. CAMADA DE PROCESSAMENTO (AUTO SCALING)
-  # ==========================================
-  EscolaTechLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateName: lt-escola-tech
-      LaunchTemplateData:
-        InstanceType: t3.micro
-        ImageId: ami-0c55b159cbfafe1f0
-        SecurityGroupIds:
-          - !Ref EC2SecurityGroup
-        InstanceMarketOptions:
-          MarketType: spot
-
-  EscolaTechAutoScalingGroup:
+  EscolaTechASG:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - HTTPListener
+      - EC2IngressFromALB
+      - PrivateDefaultRoute
+      - PrivateSubnetRouteTableAssociation1
+      - PrivateSubnetRouteTableAssociation2
     Properties:
-      AutoScalingGroupName: asg-escola-tech
-      VPCZoneIdentifier: !Ref PrivateSubnets
-      TargetGroupARNs:
-        - !Ref ALBTargetGroup
-      MinSize: '2'
-      MaxSize: '10'
+      AutoScalingGroupName: escola-tech-asg
       LaunchTemplate:
-        LaunchTemplateId: !Ref EscolaTechLaunchTemplate
-        Version: !GetAtt EscolaTechLaunchTemplate.LatestVersionNumber
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      DefaultInstanceWarmup: 300
+      MinSize: !Ref MinCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxCapacity
+      Tags:
+        - Key: Name
+          Value: escola-tech-ec2
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: EscolaTech
+          PropagateAtLaunch: true
 
-  ScaleOutPolicy:
+  CpuTargetTrackingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
-      AutoScalingGroupName: !Ref EscolaTechAutoScalingGroup
+      AutoScalingGroupName: !Ref EscolaTechASG
       PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 300
       TargetTrackingConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: 50.0
+        DisableScaleIn: false
 
-  # ==========================================
-  # 4. CAMADA DE DADOS (AMAZON RDS)
-  # ==========================================
-  DBSubnetGroup:
-    Type: AWS::RDS::DBSubnetGroup
-    Properties:
-      DBSubnetGroupDescription: Sub-redes para a Base de Dados
-      SubnetIds: !Ref PrivateSubnets
-
-  EscolaTechDB:
-    Type: AWS::RDS::DBInstance
-    Properties:
-      DBInstanceIdentifier: rds-escola-tech
-      Engine: mysql
-      EngineVersion: "8.0"
-      DBInstanceClass: db.t3.micro
-      MultiAZ: true
-      AllocatedStorage: "20"
-      MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Ref DBPassword
-      DBSubnetGroupName: !Ref DBSubnetGroup
-      VPCSecurityGroups:
-        - !Ref RDSSecurityGroup
+Outputs:
+  SiteURL:
+    Description: Abra este endereco HTTP apos os dois targets ficarem Healthy.
+    Value: !Sub 'http://${EscolaTechALB.DNSName}'
+  ALBDNSName:
+    Description: DNS publico do Application Load Balancer.
+    Value: !GetAtt EscolaTechALB.DNSName
+  VPCId:
+    Description: ID da nova VPC.
+    Value: !Ref EscolaTechVPC
+  TargetGroupARN:
+    Description: ARN do Target Group gerenciado pelo Auto Scaling.
+    Value: !Ref WebTargetGroup
+  AutoScalingGroupName:
+    Description: Nome do Auto Scaling Group.
+    Value: !Ref EscolaTechASG
+  NATGatewayId:
+    Description: NAT zonal compartilhado pelas duas subnets privadas.
+    Value: !Ref NatGateway
