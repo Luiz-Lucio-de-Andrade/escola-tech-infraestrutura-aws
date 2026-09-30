@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IaC - Arquitetura Escola Tech: VPC, ALB, Auto Scaling (Spot) e RDS MySQL (Multi-AZ)'
+
+Parameters:
+  EnvironmentName:
+    Description: Nome do ambiente (ex. Producao)
+    Type: String
+    Default: EscolaTech-Prod
+
+  DBUsername:
+    Description: Nome de utilizador master da Base de Dados
+    Type: String
+    Default: adminescola
+
+  DBPassword:
+    Description: Password da Base de Dados (Para o TCC, inserida manualmente ou via Secrets Manager)
+    Type: String
+    NoEcho: true
+
+Resources:
+  # ==========================================
+  # 1. SEGURANÇA (SECURITY GROUPS)
+  # ==========================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite trafego HTTP/HTTPS da internet para o Load Balancer
+      VpcId: !Ref VpcId # Assumindo uma VPC existente
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite trafego apenas do Load Balancer para as Instancias EC2
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite trafego apenas das instancias EC2 para o MySQL (Porta 3306)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  # ==========================================
+  # 2. CAMADA DE ACESSO (LOAD BALANCER)
+  # ==========================================
+  EscolaTechALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: alb-escola-tech
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref PublicSubnets # Requer 2 sub-redes para alta disponibilidade
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: tg-escola-tech
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref EscolaTechALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ==========================================
+  # 3. CAMADA DE PROCESSAMENTO (AUTO SCALING)
+  # ==========================================
+  EscolaTechLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: lt-escola-tech
+      LaunchTemplateData:
+        InstanceType: t3.micro # Free Tier / Baixo Custo
+        ImageId: ami-0c55b159cbfafe1f0 # Amazon Linux 2 AMI
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        InstanceMarketOptions:
+          MarketType: spot # Estrategia de reducao de custos (Ate 90% de desconto)
+
+  EscolaTechAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: asg-escola-tech
+      VPCZoneIdentifier: !Ref PrivateSubnets # Instancias rodam em rede privada (Seguranca)
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      MinSize: '2' # Capacidade base para Multi-AZ
+      MaxSize: '10' # Escala maxima para os picos de marketing
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EscolaTechLaunchTemplate
+        Version: !GetAtt EscolaTechLaunchTemplate.LatestVersionNumber
+
+  # Gatilho de Escalabilidade: 50% CPU
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref EscolaTechAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0 # Cria maquinas quando a CPU atingir 50%
+
+  # ==========================================
+  # 4. CAMADA DE DADOS (AMAZON RDS)
+  # ==========================================
+  EscolaTechDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: rds-escola-tech
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro # Instancia Economica
+      MultiAZ: true # GARANTIA DE RESILIENCIA: Duplica a BD em outra zona
+      AllocatedStorage: "20"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
